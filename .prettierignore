@@ -1,0 +1,5 @@
+node_modules/
+dist/
+magic-postman-scripts.js
+.yarn/
+yarn.lock

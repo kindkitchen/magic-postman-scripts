@@ -1,16 +1,30 @@
 {
   "name": "magic-postman-scripts",
-  "version": "1.2.0",
-  "type": "commonjs",
+  "version": "2.0.0",
+  "type": "module",
   "main": "./dist/index.js",
+  "packageManager": "yarn@4.18.1",
+  "engines": {
+    "node": "26.x"
+  },
   "scripts": {
-    "start": "deno task && deno task start",
-    "pr": "deno task merge-dev-into-main"
+    "build": "yarn typecheck && node scripts/build.js",
+    "start": "yarn build",
+    "transpile": "yarn typecheck",
+    "clean": "node scripts/build.js --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/regression.test.js",
+    "test:postman": "node tests/postman-smoke.js",
+    "check:bundle": "node scripts/build.js --check",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "yarn typecheck && yarn format:check && yarn test && yarn check:bundle",
+    "gitam": "yarn check && git add -A && git commit",
+    "pr": "yarn gitam && git push origin dev && gh pr create --fill-verbose && gh pr merge --auto --merge"
   },
   "devDependencies": {
-    "@types/chai": "^5.0.1",
-    "@types/postman-collection": "^3.5.10",
-    "pkgroll": "^2.11.2",
+    "esbuild": "^0.28.2",
+    "prettier": "^3.9.10",
     "typescript": "^5.8.2"
   }
 }

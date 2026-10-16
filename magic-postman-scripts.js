@@ -1,160 +1,340 @@
 "use strict";
-
-function guard_before_query() {
-  const env_name_like = magic.guard?.env_name_like;
-  const curr = pm.environment.name;
-  let ok = env_name_like ? false : true;
-  if (env_name_like) {
-    if (Array.isArray(env_name_like)) {
-      ok = env_name_like.some((like) => new RegExp(like).test(curr));
-    } else {
-      ok = new RegExp(env_name_like).test(curr);
-    }
-  }
-  if (!ok) {
-    throw new Error(`Use with "${env_name_like}"-like named environment!`);
-  }
-}
-
-function deep_merge(...objects) {
-  const isObject = (obj) => obj && typeof obj === "object";
-  return objects.reduce((prev, obj) => {
-    Object.keys(obj).forEach((key) => {
-      const pVal = prev[key];
-      const oVal = obj[key];
-      if (Array.isArray(pVal) && Array.isArray(oVal)) {
-        prev[key] = pVal.concat(...oVal);
-      } else if (isObject(pVal) && isObject(oVal)) {
-        prev[key] = deep_merge(pVal, oVal);
-      } else {
-        prev[key] = oVal;
-      }
-    });
-    return prev;
-  }, {});
-}
-
-function mapping(mapping, source, destination, prefix = "") {
-  if (!mapping) return;
-  Object.entries(mapping).forEach(([k, mayBePath]) => {
-    const last = mayBePath.pop();
-    const path = mayBePath;
-    if (!last) {
-      return;
-    }
-    const options = {
-      type: "string",
-      strategy: "replace",
-      magic: null,
-    };
-    if (typeof last === "string") {
-      path.push(last);
-    } else {
-      last.type && (options.type = last.type);
-      last.strategy && (options.strategy = last.strategy);
-      last.magic && (options.magic = last.magic);
-    }
-    let value = path.reduce((acc, p) => acc[p], source);
-    if (options.magic) {
-      try {
-        const transform = eval(options.magic);
-        value = transform(value);
-      } catch {
-        console.info("PROBLEM: unable to make magic transformation for value");
-      }
-    }
-    const key = prefix + k;
-    const prev = pm[destination].get(key);
-    if (prev && options.strategy === "propose") {
-      value = prev;
-      console.info(
-        "The old value will be used. New will be ignored. Becase of <propose> strategy.",
+(() => {
+  // src/lib/lifecycle.ts
+  function current_phase() {
+    const event = pm.info?.eventName;
+    if (event === "prerequest" || event === "test") return event;
+    if (event !== void 0) {
+      throw new Error(
+        "MAGIC_ERROR: only HTTP prerequest/test events are supported"
       );
-    } else if (
-      options.strategy === "replace" || /// this is the exactly strategy that will be used for all another inline or-like conditions
-      !prev || /// nothing to do with strategies
-      options.type !== typeof prev && /// for types mismatch between prev and new values we use default <replace> strategy
-        options.type === "array" && !Array.isArray(prev) ||
-      !["object", "array"].includes(options.type)
-    );
-    else {
-      if (options.strategy === "merge") {
-        value = Array.isArray(value)
-          ? [...prev, ...value]
-          : { ...prev, ...value };
-      } else if (options.strategy === "deep-merge") {
-        value = deep_merge(prev, value);
-      } else {
+    }
+    return pm.response ? "test" : "prerequest";
+  }
+
+  // src/guard_before_query.ts
+  function guard_before_query() {
+    const patterns = magic.guard?.env_name_like;
+    if (patterns === void 0) return;
+    const list = Array.isArray(patterns) ? patterns : [patterns];
+    let matches = false;
+    let invalid = false;
+    try {
+      const expressions = list.map((pattern) => {
+        if (typeof pattern !== "string" && Object.prototype.toString.call(pattern) !== "[object RegExp]") {
+          throw new Error("Invalid pattern");
+        }
+        return new RegExp(pattern);
+      });
+      matches = expressions.some(
+        (expression) => expression.test(pm.environment.name ?? "")
+      );
+    } catch {
+      invalid = true;
+    }
+    if (matches && !invalid) return;
+    const reason = invalid ? "MAGIC_ERROR: invalid magic.guard.env_name_like pattern" : "MAGIC_ERROR: environment does not match magic.guard.env_name_like";
+    if (current_phase() === "prerequest") {
+      if (typeof pm.execution?.skipRequest !== "function") {
         throw new Error(
-          "MAGIC_ERROR: not exhaustive condition pipe was used to check <strategy>",
+          reason + "; runtime lacks pm.execution.skipRequest(); request cancellation cannot be guaranteed"
+        );
+      }
+      console.warn(reason);
+      pm.execution.skipRequest();
+    }
+    throw new Error(reason);
+  }
+
+  // src/helpers/deep_merge.ts
+  var unsafeKeys = /* @__PURE__ */ new Set(["__proto__", "constructor", "prototype"]);
+  function is_record(value2) {
+    if (value2 === null || typeof value2 !== "object" || Array.isArray(value2)) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(value2);
+    return prototype === null || Object.getPrototypeOf(prototype) === null;
+  }
+  function clone_value(value2) {
+    if (Array.isArray(value2)) return value2.map(clone_value);
+    if (is_record(value2)) {
+      const result = {};
+      for (const key2 of Object.keys(value2)) {
+        if (unsafeKeys.has(key2)) throw new Error("Unsafe object key");
+        result[key2] = clone_value(value2[key2]);
+      }
+      return result;
+    }
+    if (value2 !== null && typeof value2 === "object") {
+      throw new Error("Expected JSON-compatible data");
+    }
+    if (value2 === void 0 || typeof value2 === "function" || typeof value2 === "symbol" || typeof value2 === "bigint" || typeof value2 === "number" && !Number.isFinite(value2)) {
+      throw new Error("Expected JSON-compatible data");
+    }
+    return value2;
+  }
+  function merge_pair(previous2, incoming) {
+    if (Array.isArray(previous2) && Array.isArray(incoming)) {
+      return [...previous2, ...incoming];
+    }
+    if (is_record(previous2) && is_record(incoming)) {
+      const result = { ...previous2 };
+      for (const key2 of Object.keys(incoming)) {
+        result[key2] = Object.prototype.hasOwnProperty.call(previous2, key2) ? merge_pair(previous2[key2], incoming[key2]) : incoming[key2];
+      }
+      return result;
+    }
+    return incoming;
+  }
+  function deep_merge(...objects) {
+    return objects.reduce(
+      (previous2, incoming) => merge_pair(previous2, clone_value(incoming)),
+      {}
+    );
+  }
+
+  // src/lib/values.ts
+  function convert_value(value2, type) {
+    if (type === "string") {
+      return typeof value2 === "object" && value2 !== null ? JSON.stringify(clone_value(value2)) : String(clone_value(value2));
+    }
+    if (type === "number") {
+      if (typeof value2 !== "number" && !(typeof value2 === "string" && value2.trim() !== ""))
+        throw new Error("Expected a finite number or nonempty numeric string");
+      const converted = Number(value2);
+      if (!Number.isFinite(converted))
+        throw new Error("Expected a finite number");
+      return converted;
+    }
+    if (type === "boolean") {
+      if (value2 === true || value2 === 1 || value2 === "true" || value2 === "1")
+        return true;
+      if (value2 === false || value2 === 0 || value2 === "false" || value2 === "0")
+        return false;
+      throw new Error("Expected a boolean, 0/1, or true/false string");
+    }
+    let parsed = value2;
+    if (typeof value2 === "string") {
+      try {
+        parsed = JSON.parse(value2);
+      } catch {
+        throw new Error("Expected valid JSON for object/array conversion");
+      }
+    }
+    if (type === "array" ? !Array.isArray(parsed) : !is_record(parsed)) {
+      throw new Error(`Expected ${type}`);
+    }
+    return clone_value(parsed);
+  }
+  function previous_container(value2, type) {
+    try {
+      return convert_value(value2, type);
+    } catch {
+      return void 0;
+    }
+  }
+  function serialize_value(value2) {
+    return typeof value2 === "string" ? value2 : JSON.stringify(value2);
+  }
+
+  // src/lib/mapping.ts
+  var types = ["string", "number", "boolean", "object", "array"];
+  var strategies = ["replace", "propose", "merge", "deep-merge"];
+  function mapping(configuration, source, destination, prefix = "") {
+    if (configuration === void 0) return;
+    if (!is_record(configuration)) throw new Error("Mapping must be an object");
+    const errors = [];
+    for (const [name, definition] of Object.entries(configuration)) {
+      const key = prefix + name;
+      let path = [];
+      let stage = "validate mapping configuration";
+      try {
+        if (!Array.isArray(definition)) throw new Error();
+        const parts = [...definition];
+        const last = parts[parts.length - 1];
+        const supplied = is_record(last) ? parts.pop() : {};
+        if (!parts.every(
+          (part) => typeof part === "string" || typeof part === "number" && Number.isInteger(part) && part >= 0
+        ))
+          throw new Error();
+        path = parts;
+        const options = {
+          type: supplied.type ?? "string",
+          strategy: supplied.strategy ?? "replace",
+          magic: supplied.magic ?? null,
+          on_missing: supplied.on_missing ?? "error"
+        };
+        if (!types.includes(options.type) || !strategies.includes(options.strategy) || !["error", "skip"].includes(options.on_missing) || options.magic !== null && typeof options.magic !== "string")
+          throw new Error();
+        const scope = pm[destination];
+        stage = "read existing variable";
+        const previous = scope.get(key);
+        const exists = scope.has ? scope.has(key) : previous !== void 0 && previous !== null;
+        if (options.strategy === "propose" && exists) {
+          if (magic.debug)
+            console.info(`MAGIC: keep ${destination}.${key} (propose)`);
+          continue;
+        }
+        stage = "read path";
+        let value = source;
+        let missing = value === void 0;
+        for (const part of path) {
+          if (value === null || value === void 0 || !Object.prototype.hasOwnProperty.call(value, part)) {
+            missing = true;
+            break;
+          }
+          value = value[part];
+          if (value === void 0) missing = true;
+        }
+        if (missing) {
+          if (options.on_missing === "skip") {
+            if (magic.debug)
+              console.info(`MAGIC: skip ${destination}.${key} (missing path)`);
+            continue;
+          }
+          stage = "read missing path";
+          throw new Error();
+        }
+        if (options.magic !== null) {
+          stage = "transform value (expected a synchronous function expression)";
+          const transform = eval(`(${options.magic})`);
+          if (typeof transform !== "function" || Object.prototype.toString.call(transform) === "[object AsyncFunction]")
+            throw new Error();
+          value = transform(value);
+          if (value !== null && (typeof value === "object" || typeof value === "function") && typeof value.then === "function") {
+            void Promise.resolve(value).catch(() => {
+            });
+            throw new Error();
+          }
+        }
+        stage = `convert value to ${options.type} (expected JSON-compatible data)`;
+        value = convert_value(value, options.type);
+        if ((options.strategy === "merge" || options.strategy === "deep-merge") && (options.type === "object" || options.type === "array") && exists) {
+          stage = "merge values";
+          const oldValue = previous_container(previous, options.type);
+          if (oldValue !== void 0) {
+            if (options.strategy === "deep-merge") {
+              value = deep_merge(oldValue, value);
+            } else {
+              value = options.type === "array" ? [...oldValue, ...value] : { ...oldValue, ...value };
+            }
+          }
+        }
+        stage = "save variable";
+        scope.set(key, serialize_value(value));
+        if (magic.debug) {
+          console.info(
+            `MAGIC: set ${destination}.${key} (${options.type}, ${options.strategy})`
+          );
+        }
+      } catch {
+        errors.push(
+          `${destination}.${key} at ${JSON.stringify(path)}: unable to ${stage}`
         );
       }
     }
-    console.info(
-      `Set ${destination}.${
-        prefix + k
-      } = ${value} (as ${options.type} data-type)`,
-    );
-    pm[destination].set(
-      key,
-      value,
-      options.type,
-    );
-  });
-}
+    if (errors.length) throw new Error("MAGIC_ERROR: " + errors.join("; "));
+  }
 
-function test_after_response() {
-  const {
-    name = pm.request.name,
-    description,
-  } = magic;
-  name && console.info(name);
-  pm.test(name, () => {
-    const {
-      res_codes = [200, 201, 202, 203, 204],
-      res_jbody_to_env,
-      res_jbody_to_col,
-      res_jbody_to_globals,
-      req_jbody_to_env,
-      req_jbody_to_col,
-      req_jbody_to_globals,
-      req_fbody_to_env,
-      req_fbody_to_globals,
-      req_fbody_to_col,
-      prefix,
-    } = magic;
-    const actual_res_code = pm.response.code ||
-      pm.response.transport.http?.statusCode;
-    if (!actual_res_code) {
-      console.warn("Unable to get res status code... Please open the issue");
-    } else if (!res_codes.includes(actual_res_code)) {
-      console.warn("Response code is not declared in <magic.res_codes>");
-      pm.expect(res_codes).includes(actual_res_code);
-      return;
-    }
-    let jData = {};
-    try {
-      jData = pm.response.json();
-    } catch (err) {
-      jData = pm.response;
-    }
-    const rawReqBody = JSON.parse(pm.request.body?.raw || "{}");
-    let fData = {};
-    try {
-      fData = pm.request.body.formdata.toObject();
-    } catch {
-    }
-    mapping(res_jbody_to_env, jData, "environment", prefix);
-    mapping(res_jbody_to_col, jData, "collectionVariables", prefix);
-    mapping(res_jbody_to_globals, jData, "globals", prefix);
-    mapping(req_jbody_to_env, rawReqBody, "environment", prefix);
-    mapping(req_jbody_to_col, rawReqBody, "collectionVariables", prefix);
-    mapping(req_jbody_to_globals, rawReqBody, "globals", prefix);
-    mapping(req_fbody_to_env, fData, "environment", prefix);
-    mapping(req_fbody_to_col, fData, "collectionVariables", prefix);
-    mapping(req_fbody_to_globals, fData, "globals", prefix);
-  });
-}
+  // src/test_after_response.ts
+  var has_mappings = (groups) => groups.some(
+    ([configuration2]) => configuration2 !== void 0 && (!is_record(configuration2) || Object.keys(configuration2).length > 0)
+  );
+  function test_after_response() {
+    const name2 = magic.name || pm.info?.requestName || pm.request.name || "Magic Postman Scripts";
+    pm.test(name2, () => {
+      const resCodes = magic.res_codes ?? [200, 201, 202, 203, 204];
+      const code = pm.response?.code || pm.response?.transport?.http?.statusCode;
+      if (!Array.isArray(resCodes) || !resCodes.every(
+        (value2) => Number.isInteger(value2) && value2 >= 100 && value2 <= 599
+      ))
+        throw new Error(
+          "MAGIC_ERROR: res_codes must be an array of HTTP status codes"
+        );
+      if (!Number.isInteger(code) || !code || code < 100 || code > 599) {
+        throw new Error("MAGIC_ERROR: missing or invalid response status code");
+      }
+      if (!resCodes.includes(code)) {
+        throw new Error(
+          `MAGIC_ERROR: response status ${code} is not allowed by res_codes`
+        );
+      }
+      if (magic.prefix !== void 0 && typeof magic.prefix !== "string") {
+        throw new Error("MAGIC_ERROR: prefix must be a string");
+      }
+      const failures = [];
+      const prepared = [];
+      const prepare = (label, groups, load) => {
+        if (!has_mappings(groups)) return;
+        let source2;
+        try {
+          source2 = load();
+        } catch {
+          failures.push(`Unable to read ${label} for configured mappings`);
+          return;
+        }
+        prepared.push({ groups, source: source2 });
+      };
+      prepare(
+        "response JSON",
+        [
+          [magic.res_jbody_to_env, "environment"],
+          [magic.res_jbody_to_col, "collectionVariables"],
+          [magic.res_jbody_to_globals, "globals"]
+        ],
+        () => {
+          if (!pm.response) throw new Error();
+          return pm.response.json();
+        }
+      );
+      prepare(
+        "request JSON",
+        [
+          [magic.req_jbody_to_env, "environment"],
+          [magic.req_jbody_to_col, "collectionVariables"],
+          [magic.req_jbody_to_globals, "globals"]
+        ],
+        () => {
+          const body = pm.request.body;
+          if (!body || body.mode !== void 0 && body.mode !== "raw")
+            throw new Error();
+          if (typeof body.raw !== "string") throw new Error();
+          const raw = pm.variables ? pm.variables.replaceIn(body.raw) : body.raw;
+          return JSON.parse(raw);
+        }
+      );
+      prepare(
+        "request form-data",
+        [
+          [magic.req_fbody_to_env, "environment"],
+          [magic.req_fbody_to_col, "collectionVariables"],
+          [magic.req_fbody_to_globals, "globals"]
+        ],
+        () => {
+          const body = pm.request.body;
+          if (!body || body.mode !== void 0 && body.mode !== "formdata")
+            throw new Error();
+          if (!body.formdata) throw new Error();
+          return body.formdata.toObject();
+        }
+      );
+      for (const { groups, source: source2 } of prepared) {
+        for (const [configuration2, destination2] of groups) {
+          try {
+            mapping(configuration2, source2, destination2, magic.prefix);
+          } catch (error) {
+            failures.push(
+              error instanceof Error ? error.message : "Unable to apply mapping"
+            );
+          }
+        }
+      }
+      if (failures.length) throw new Error("MAGIC_ERROR: " + failures.join("; "));
+    });
+  }
 
-guard_before_query();
-test_after_response();
+  // src/index.ts
+  var phase = current_phase();
+  guard_before_query();
+  if (phase === "test") test_after_response();
+})();
