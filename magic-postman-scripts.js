@@ -156,8 +156,5 @@ function test_after_response() {
   });
 }
 
-if (pm.info.eventName === "beforeQuery") {
-  guard_before_query();
-} else {
-  test_after_response();
-}
+guard_before_query();
+test_after_response();
